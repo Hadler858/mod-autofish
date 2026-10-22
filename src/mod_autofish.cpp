@@ -33,6 +33,7 @@
 
 #include <cmath>
 #include <string>
+#include <unordered_set>
 
 using namespace Acore::ChatCommands;
 
@@ -86,6 +87,12 @@ namespace
         uint32     catches        = 0;
         uint32     casts          = 0;
         ObjectGuid openingItem;
+        // item-use safety net: if using an item didn't consume it, skip that item
+        // for the rest of the session instead of retrying forever
+        uint32     pendingEntry   = 0;
+        uint32     pendingCount   = 0;
+        uint64     pendingCheckAt = 0;
+        std::unordered_set<uint32> skipEntries;
         float      anchorX = 0, anchorY = 0, anchorZ = 0, anchorO = 0;
     };
 
@@ -157,6 +164,8 @@ namespace
         st->catches       = 0;
         st->casts         = 0;
         st->openingItem.Clear();
+        st->pendingEntry  = 0;
+        st->skipEntries.clear();
         SetAnchor(player, st);
         Notify(player, "On. Move, turn or type .autofish off to stop.");
     }
@@ -262,6 +271,37 @@ namespace
     }
 
     // ---------------------------------------------------------- next actions
+    // Remember how many of this item we had, to confirm later that using it worked.
+    void ExpectConsumed(Player* player, AutoFishState* st, uint32 entry, uint32 checkAfterMs)
+    {
+        st->pendingEntry   = entry;
+        st->pendingCount   = player->GetItemCount(entry);
+        st->pendingCheckAt = Now() + checkAfterMs;
+    }
+
+    // If an item we tried to use is still all there, skip it from now on.
+    void CheckConsumed(Player* player, AutoFishState* st)
+    {
+        if (!st->pendingEntry)
+            return;
+        if (player->GetItemCount(st->pendingEntry) < st->pendingCount)
+        {
+            st->pendingEntry = 0;   // it was used up - worked
+            return;
+        }
+        if (Now() < st->pendingCheckAt || player->IsNonMeleeSpellCast(false))
+            return;
+        if (player->GetItemCount(st->pendingEntry) >= st->pendingCount)
+        {
+            st->skipEntries.insert(st->pendingEntry);
+            std::string name = std::to_string(st->pendingEntry);
+            if (ItemTemplate const* proto = sObjectMgr->GetItemTemplate(st->pendingEntry))
+                name = proto->Name1;
+            Notify(player, "Couldn't use " + name + " - skipping it this session.");
+        }
+        st->pendingEntry = 0;
+    }
+
     bool TryApplyLure(Player* player, AutoFishState* st, Item* pole)
     {
         if (!sCfg.autoLure || pole->GetEnchantmentId(TEMP_ENCHANTMENT_SLOT))
@@ -269,12 +309,15 @@ namespace
 
         for (uint32 entry : LURES)
         {
+            if (st->skipEntries.count(entry))
+                continue;
             Item* lure = player->GetItemByEntry(entry);
             if (!lure || player->CanUseItem(lure) != EQUIP_ERR_OK)
                 continue;
 
             SpellCastTargets targets;
             targets.SetItemTarget(pole);
+            ExpectConsumed(player, st, entry, 8000);   // lures take a few seconds to apply
             player->CastItemUseSpell(lure, targets, 0, 0);
             st->nextActionAt = Now() + 1000;
             return true;
@@ -289,15 +332,39 @@ namespace
 
         for (uint32 entry : OPENABLES)
         {
+            if (st->skipEntries.count(entry))
+                continue;
             Item* item = player->GetItemByEntry(entry);
-            if (!item || (item->GetTemplate()->LockID && item->IsLocked()))
+            if (!item)
+                continue;
+            ItemTemplate const* proto = item->GetTemplate();
+            if (proto->LockID && item->IsLocked())
                 continue;
 
             st->openingItem = item->GetGUID();
-            WorldPacket packet(CMSG_OPEN_ITEM, 2);
-            packet << uint8(item->GetBagSlot()) << uint8(item->GetSlot());
-            player->GetSession()->HandleOpenItemOpcode(packet);
-            st->nextActionAt = Now() + 500;
+            ExpectConsumed(player, st, entry, 4000);
+
+            if (proto->HasFlag(ITEM_FLAG_HAS_LOOT))
+            {
+                // lockbox-style container (e.g. Reinforced Crate): opens a loot window
+                WorldPacket packet(CMSG_OPEN_ITEM, 2);
+                packet << uint8(item->GetBagSlot()) << uint8(item->GetSlot());
+                player->GetSession()->HandleOpenItemOpcode(packet);
+            }
+            else if (player->CanUseItem(item) == EQUIP_ERR_OK)
+            {
+                // clams: "Use: Open the clam" - same as right-clicking it
+                SpellCastTargets targets;   // no target, like the client sends for self-use items
+                player->CastItemUseSpell(item, targets, 0, 0);
+            }
+            else
+            {
+                st->skipEntries.insert(entry);
+                st->pendingEntry = 0;
+                continue;
+            }
+
+            st->nextActionAt = Now() + 1000;
             return true;
         }
         return false;
@@ -397,6 +464,9 @@ namespace
         if (player->GetFreeInventorySpace() < sCfg.minFreeSlots)
             return Stop(player, st, "bags full");
 
+        CheckConsumed(player, st);
+        if (st->pendingEntry)
+            return;   // still waiting to confirm the last item use
         if (TryApplyLure(player, st, pole))
             return;
         if (TryOpenCatch(player, st))
